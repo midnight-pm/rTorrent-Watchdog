@@ -1,0 +1,484 @@
+#!/bin/bash
+
+###############################################################################
+#
+# Description:
+#	This is a watchdog script to monitor rTorrent for crashes on CentOS and
+#	Fedora, and to automatically restart it in the event of one. It also will
+#	issue a notification in the event of a crash (if enabled).
+#
+#	This script leverages "rtorrent-init-script" by Super Jamie for getting
+#	the status of, stopping, and starting rTorrent.
+#	https://github.com/djhowarth/rtorrent-init-script
+#
+#	For notifications, this script leverages SparkPost and its REST
+#	Transmission's API.
+#	This script can be set to run via cron with a string such as:
+#		*/2 * * * * /home/rtorrent/bin/rtorrent_watch > /dev/null 2&>1
+#	or
+#		*/2 * * * * /home/rtorrent/bin/rtorrent_watch &> /dev/null
+#
+###############################################################################
+
+###############################################################################
+#
+# Configuration Options
+#
+###############################################################################
+
+# Specify the username of the user rTorrent is running as, and the path to the session directory.
+rtorrent_user="rtorrent"
+rtorrent_session="/home/rtorrent/.session"
+
+# Specify length of time to wait for rTorrent process to start
+rtorrent_timer="60"
+
+# Notify options
+notify="true"						# Enable or Disable Notifications
+notify_recpt="recipient@domain.tld" # Recipient Address
+notify_rname="Test Recipient"		# Recipient Name
+notify_fname="Test Sender"			# Sender Friendly From
+notify_b_dmn="bounce.domain.tld"	# Sender Bounce Domain
+notify_f_dmn="sending.domain.tld"	# Sender Sending Domain
+notify_xmail="An Email Client"		# Sender X-Mailer
+
+# SparkPost Config
+# https://developers.sparkpost.com/api/transmissions/
+sp_api_endpoint="https://api.sparkpost.com"
+sp_api_auth_key="{{API_KEY}}"	# API Key
+sp_api_n_r_errs="3"				# Recipient Errors
+sp_campaign_nme="{{CAMPAIGN}}"  # Campaign Name
+sp_event_t_open="true"  		# Open Tracking
+sp_event_t_clck="true"  		# Click Tracking
+sp_sandbox_test="false" 		# Sandbox Test
+sp_skip_supress="false" 		# Skip Suppression
+sp_transactionl="false" 		# Transactional
+
+###############################################################################
+#
+# No user-configurable options exist below this line.
+#
+###############################################################################
+
+###############################################################################
+# Functions are defined here
+###############################################################################
+
+iso8601()
+{
+	echo $(date +%FT%T%z)
+}
+
+status()
+{
+	# Get Status of the rTorrent Client from the Init Script
+	status=$(/etc/init.d/bittorrent status)
+
+	# Return Status
+	echo $status | awk -F "test" '{print $2}' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+get_pid()
+{
+	# Get Status of the rTorrent Client from the Init Script
+	status=$(/etc/init.d/bittorrent status)
+
+	# Return PID
+	echo $status | awk -F "pid" '{print $2}' | tr -d ")" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+get_pid_aux()
+{
+	# Return the output of "ps aux" for the provided PID.
+	input=$1
+
+	echo "$(ps aux | head -n1; ps aux | grep $input | grep -v 'grep')"
+}
+
+verify_pid()
+{
+	# Validate that the claimed PID is Actually and that the Process is Running.
+	input=$1
+
+	if ps_check=$(ps aux | grep $input | grep -v "grep")
+	then
+
+		user=$(echo $ps_check | awk -F " " '{print $1}')
+		pid=$(echo $ps_check | awk -F " " '{print $2}')
+
+		# echo $user
+		# echo $pid
+
+		if [ "$user" = "${rtorrent_user}" ]
+		then
+			if [ "$input" = "$pid" ]
+			then
+				echo "true"
+			else
+				echo "false"
+			fi
+		else
+			echo "false"
+		fi
+	else
+		echo "false"
+	fi
+
+}
+
+start()
+{
+	# Stop rTorrent
+	end=$(/etc/init.d/bittorrent stop)
+
+	# Clean Up
+	rm -f ${rtorrent_session}/rtorrent.lock
+
+	# Start rTorrent
+	begin=$(/etc/init.d/bittorrent start)
+
+	i=0
+	while [[ $i -lt ${rtorrent_timer} ]]
+	do
+		if ps_check=$(ps aux | grep ${rtorrent_user} | grep -v grep | grep -iv SCREEN | grep " ${rtorrent_user}")
+		then
+			user=$(echo $ps_check | awk -F " " '{print $1}')
+			process=$(echo $ps_check | awk -F " " '{print $11}')
+
+			if [ "$user" = "${rtorrent_user}" ]
+			then
+				if [ "$process" = "${rtorrent_user}" ]
+				then
+					echo "true"
+					break
+				else
+					echo "false"
+				fi
+			else
+				echo "false"
+			fi
+		else
+			echo "false"
+		fi
+	((i++))
+	sleep 2
+	done
+}
+
+stop()
+{
+	# Kill Existing Session
+	input=$1
+
+	if kill -s INT $input
+	then
+		rm -f ${rtorrent_session}/rtorrent.lock
+		echo "true"
+	else
+		if kill -s KILL $input
+		then
+			rm -f ${rtorrent_session}/rtorrent.lock
+			echo "true" 
+		else
+			rm -f ${rtorrent_session}/rtorrent.lock
+			echo "false"
+		fi
+	fi
+}
+
+sp_send_notification()
+{
+
+	# Build X-MSYS-API JSON
+
+		# Set X-MSYS-API Parameters
+		campaign_id="${sp_campaign_nme}"
+		open_tracking="${sp_event_t_open}"
+		click_tracking="${sp_event_t_clck}"
+		sandbox="${sp_sandbox_test}"
+		skip_suppression="${sp_skip_supress}"
+		transactional="${sp_transactionl}"
+
+	# Grab function inputs
+
+		msg_subject="$1"
+		msg_bdytext="$2"
+		msg_bdyhtml="$3"
+
+	# Convert Text and HTML to JSON strings
+
+		json_body_text=$(echo "$msg_bdytext" | jq -R -s)
+		json_body_html=$(echo "$msg_bdyhtml" | jq -R -s)
+
+	# Build the JSON
+
+		read -r -d '' json << EOM
+{
+    "options": {
+        "open_tracking": $open_tracking,
+        "click_tracking": $click_tracking,
+        "sandbox": $sandbox,
+        "skip_supression": $skip_suppression,
+        "transactional": $transactional
+    },
+    "campaign_id": "$campaign_id",
+    "metadata": {
+        "hostname": "$(echo $(hostname -f))"
+    },
+    "recipients": [
+        {
+            "address":{
+                        "email":"${notify_recpt}",
+                        "name":"${notify_rname}"
+                },
+                "metadata": {
+                    "place": "Parts Unknown"
+                }
+        }
+    ],
+    "return_path": "$(hostname -s)@${notify_b_dmn}",
+    "content":{
+        "from": {
+            "name": "${notify_fname}",
+            "email": "$(hostname -s)@${notify_f_dmn}"
+        },
+        "headers": {
+                "X-Mailer": "${notify_xmail}"
+        },
+        "subject": "$msg_subject",
+        "text": $json_body_text,
+        "html": $json_body_html
+   }
+}
+EOM
+
+        
+###################################################################################
+#
+# Create a Transmission (inline text/html and recipients)
+#
+# Note: Sending limits apply to SparkPost accounts only. When a transmission is
+# created, the number of messages in the transmission is compared to the sending
+# limit of your account. If the transmission will cause you to exceed your sending
+# limit, the entire transmission results in an error and no messages are sent. Note
+# that no messages will be sent for the given transmission, regardless of the
+# number of messages that caused you to exceed your sending limit. In this case,
+# the Transmission API will return an HTTP 420 error code with an error detailing
+# whether you would exceed your hourly, daily, or sandbox sending limit.
+###################################################################################
+
+# Create a temp file to store the response.
+tempfile=$(mktemp)
+
+# Issue the POST using cURL
+curl --silent --include --request POST \
+  ${sp_api_endpoint}/api/v1/transmissions?num_rcpt_errors=${sp_api_n_r_errs} \
+  --header "Accept: application/json" \
+  --header "Authorization: ${sp_api_auth_key}" \
+  --header "Content-Type: application/json" \
+  --header "cache-control: no-cache" \
+  --data "$json" \
+  --output "$tempfile"
+
+cat $tempfile | tail -n1 | jq
+}
+
+###############################################################################
+
+# Get rTorrent PID
+pid=$(get_pid)
+
+# Validate the PID
+if [ $(verify_pid $pid) = "true" ]
+then
+	echo "Running."
+
+	# rTorrent is Running
+
+	echo $(status) | jq -R -s
+
+	# No Actions are Needed
+
+else
+	echo "Not Running."
+
+	# rTorrent is Not Running.
+
+	test_response=$(echo $(status) | awk -F "." '{print $1}')
+	if [ "$test_response" = "rTorrent is running" ]
+	then
+		crashed="true"
+	else
+		crashed="false"
+	fi
+
+	# Kill and Cleanup Existing rTorrent Process (if Running) and Session
+
+	if [ "$crashed" = "true" ]
+	then
+		if [ $(stop $pid) = "true" ]
+		then
+			kill_pid="true"
+		else
+			kill_pid="false"
+		fi
+	fi
+
+	# Start rTorrent
+
+	echo "Issuing Start Command."
+	process=$(start)
+	# echo $process
+	if [ "$process" = "true" ]
+	then
+		startup="true"
+	else
+		startup="false"
+	fi
+
+
+# exit
+
+	# Was Startup Unsuccessful?
+	if [ "$startup" = "false" ]
+	then
+		echo "Error: Startup failed."
+
+		# Send Notification if notifications are enabled.
+		if [ "$notify" = "true" ]
+		then
+			echo "Sending notification."
+
+			subject="rTorrent failed to start.."
+			read -r -d '' bdytext << EndOfBodyText
+Hello {{address.name}},
+
+An attempt to automatically restart the rTorrent process has failed.
+
+-----
+
+Message Generated: $(iso8601)
+EndOfBodyText
+			read -r -d '' bdyhtml << EndOfBodyHTML
+<html>
+<body>
+<p>Hello {{address.name}},</p>
+<p>An attempt to automatically restart the rTorrent process has failed.</p>
+<hr>
+<p></p>
+<p>Message Generated: $(iso8601)
+</body>
+</html>
+EndOfBodyHTML
+
+                        # Send Notification
+                        sp_send_notification "$subject" "$bdytext" "$bdyhtml"
+
+		else
+			echo "Notifcations are not enabled."
+		fi
+	fi
+
+	# Was Startup Successful?
+	if [ "$startup" = "true" ]
+	then
+		echo "Startup successful."
+
+		# Send Notification if notifications are enabled.
+		if [ "$notify" = "true" ]
+		then
+			echo "Sending notification."
+
+			new_pid=$(get_pid)
+			new_ps="$(get_pid_aux $new_pid)"
+			new_status=$(status)
+
+			if [ "$crashed" = "true" ]
+			then
+				# If the process was offline and crashed.
+
+				subject="rTorrent crashed and has been automatically restarted ($new_pid)."
+				read -r -d '' bdytext << EndOfBodyText
+Hello {{address.name}},
+
+The rTorrent process crashed and has been automatically started.
+
+The new PID is $new_pid.
+
+Status output: $new_status
+
+-----
+
+$new_ps
+
+-----
+
+Message Generated: $(iso8601)
+EndOfBodyText
+				read -r -d '' bdyhtml << EndOfBodyHTML
+<html>
+<body>
+<p>Hello {{address.name}},</p>
+<p>The rTorrent process crashed and has been automatically started.</p>
+<p>The new PID is $new_pid.</p>
+<p></p>
+<hr>
+<pre>
+$new_ps
+</pre>
+<hr>
+<p></p>
+<p>Message Generated: $(iso8601)
+</body>
+</html>
+EndOfBodyHTML
+
+			else
+				# If the process was offline and did not crash.
+
+				subject="rTorrent has been started ($new_pid)."
+				read -r -d '' bdytext << EndOfBodyText
+Hello {{address.name}},
+
+The rTorrent process was not running and has been automatically restarted.
+
+The new PID is $new_pid.
+
+Status output: $new_status
+
+-----
+
+$new_ps
+
+-----
+
+Message Generated: $(iso8601)
+EndOfBodyText
+				read -r -d '' bdyhtml << EndOfBodyHTML
+<html>
+<body>
+<p>Hello {{address.name}},</p>
+<p>The rTorrent process was not running and has been automatically started.</p>
+<p>The new PID is $new_pid.</p>
+<p></p>
+<hr>
+<pre>
+$new_ps
+</pre>
+<hr>
+<p></p>
+<p>Message Generated: $(iso8601)
+</body>
+</html>
+EndOfBodyHTML
+			fi
+
+			# Send Notification
+			sp_send_notification "$subject" "$bdytext" "$bdyhtml"
+		else
+			echo "Notifications are not enabled."
+		fi
+	fi
+fi
+
+# echo $(iso8601)
